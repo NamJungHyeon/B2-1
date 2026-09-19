@@ -47,6 +47,7 @@ def parse_month(text: str) -> str:
     month = int(text[5:7])
     if not 1 <= month <= 12:
         raise AppError("월은 01~12 사이여야 합니다.", "예: 2024-01")
+    parse_date(f"{text}-01")
     return text
 
 
@@ -61,10 +62,16 @@ def parse_type(text: str) -> str:
 
 
 def parse_amount(text: str) -> int:
-    text = text.strip().replace(",", "")
-    if not text.isdigit() or int(text) <= 0:
-        raise AppError("금액은 양수 정수여야 합니다.", "예: 15000")
-    return int(text)
+    text = text.strip()
+    try:
+        if not re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", text):
+            raise ValueError
+        amount = int(text.replace(",", ""))
+        if amount <= 0:
+            raise ValueError
+        return amount
+    except ValueError:
+        raise AppError("금액은 양수 정수여야 합니다.", "예: 15000 또는 15,000") from None
 
 
 def parse_tags(text: str | None) -> list[str]:
@@ -80,6 +87,8 @@ def parse_tags(text: str | None) -> list[str]:
 
 
 def parse_category_name(text: str) -> str:
+    if not isinstance(text, str):
+        raise AppError("카테고리명은 문자열이어야 합니다.")
     text = text.strip()
     if not text:
         raise AppError("카테고리명은 비어 있을 수 없습니다.", "예: food")
@@ -110,14 +119,26 @@ class Transaction:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Transaction":
+        for key in ("id", "type", "date", "category"):
+            if not isinstance(data[key], str):
+                raise ValueError(f"{key}: 문자열이 필요합니다.")
+        if not re.fullmatch(r"TX-[0-9]{6,}", data["id"]) or int(data["id"][3:]) <= 0:
+            raise ValueError("잘못된 거래 ID입니다.")
+        if type(data["amount"]) is not int or data["amount"] <= 0:
+            raise ValueError("금액은 양수 정수여야 합니다.")
+        memo, tags = data.get("memo", ""), data.get("tags", [])
+        if not isinstance(memo, str) or not isinstance(tags, list):
+            raise ValueError("메모 또는 태그 형식이 올바르지 않습니다.")
+        if any(not isinstance(tag, str) for tag in tags):
+            raise ValueError("태그는 문자열이어야 합니다.")
         return cls(
-            id=str(data["id"]),
-            type=str(data["type"]),
-            date=str(data["date"]),
-            amount=int(data["amount"]),
-            category=str(data["category"]),
-            memo=str(data.get("memo", "")),
-            tags=list(data.get("tags", [])),
+            id=data["id"],
+            type=parse_type(data["type"]),
+            date=parse_date(data["date"]),
+            amount=data["amount"],
+            category=parse_category_name(data["category"]),
+            memo=memo,
+            tags=tags,
         )
 
 
@@ -131,7 +152,11 @@ class Budget:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Budget":
-        return cls(month=str(data["month"]), amount=int(data["amount"]))
+        if not isinstance(data["month"], str):
+            raise ValueError("월은 문자열이어야 합니다.")
+        if type(data["amount"]) is not int or data["amount"] <= 0:
+            raise ValueError("예산은 양수 정수여야 합니다.")
+        return cls(month=parse_month(data["month"]), amount=data["amount"])
 
 
 @dataclass

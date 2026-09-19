@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import csv
 import functools
 import logging
 import time
@@ -32,6 +33,11 @@ def handle_errors(func: Callable[P, int]) -> Callable[P, int]:
             if exc.hint:
                 print(f"[힌트] {exc.hint}")
             logger.warning("AppError: %s", exc.message)
+            return 1
+        except (UnicodeError, csv.Error) as exc:
+            print(f"[오류] 파일 형식이 올바르지 않습니다: {exc}")
+            print("[힌트] UTF-8 인코딩과 CSV 헤더·따옴표 형식을 확인하세요.")
+            logger.warning("파일 형식 오류: %s", exc)
             return 1
         except (KeyboardInterrupt, EOFError):
             print("\n[취소] 입력이 중단되었습니다.")

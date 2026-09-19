@@ -11,16 +11,35 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO, TypeVar
 
-from budget_app.models import DEFAULT_CATEGORIES, AppError, Budget, Transaction
+from budget_app.models import DEFAULT_CATEGORIES, AppError, Budget, Transaction, parse_category_name
+
+T = TypeVar("T")
 
 TRANSACTIONS_FILE = "transactions.jsonl"
 CATEGORIES_FILE = "categories.jsonl"
 BUDGETS_FILE = "budgets.jsonl"
+
+
+@contextmanager
+def atomic_text_writer(path: Path) -> Iterator[TextIO]:
+    """쓰기 성공 시에만 대상 파일을 교체하고 실패 시 임시 파일을 정리한다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fp:
+            yield fp
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 class JsonlFile:
@@ -37,8 +56,8 @@ class JsonlFile:
         self.path.touch()
         return True
 
-    def iter_rows(self) -> Iterator[dict[str, Any]]:
-        """한 줄씩 읽어 dict로 넘긴다. 파일 전체를 메모리에 올리지 않는다."""
+    def iter_rows(self, decode: Callable[[dict[str, Any]], T] = dict) -> Iterator[T]:
+        """한 줄씩 읽고 변환하며, 손상된 행은 파일명과 줄 번호로 알린다."""
         if not self.path.exists():
             return
         with self.path.open("r", encoding="utf-8") as fp:
@@ -47,12 +66,16 @@ class JsonlFile:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("JSON 객체가 필요합니다.")
+                    value = decode(row)
+                except (ValueError, TypeError, KeyError, AppError):
                     raise AppError(
                         f"{self.path.name} {line_no}번째 줄이 손상되었습니다.",
                         "해당 줄을 직접 수정하거나 백업에서 복구하세요.",
-                    )
+                    ) from None
+                yield value
 
     def append_row(self, row: dict[str, Any]) -> None:
         self.ensure()
@@ -61,21 +84,9 @@ class JsonlFile:
 
     def rewrite_rows(self, rows: Iterable[dict[str, Any]]) -> None:
         """임시 파일에 모두 쓴 뒤 rename으로 교체한다 (원자적 쓰기)."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fp:
-                for row in rows:
-                    fp.write(json.dumps(row, ensure_ascii=False) + "\n")
-                fp.flush()
-                os.fsync(fp.fileno())
-            os.replace(tmp_name, self.path)
-        except BaseException:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
-            raise
+        with atomic_text_writer(self.path) as fp:
+            for row in rows:
+                fp.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 class TransactionRepository:
@@ -91,28 +102,29 @@ class TransactionRepository:
         return self.file.ensure()
 
     def iter_all(self) -> Iterator[Transaction]:
-        for row in self.file.iter_rows():
-            yield Transaction.from_dict(row)
+        yield from self.file.iter_rows(Transaction.from_dict)
 
     def next_id(self) -> str:
         last = 0
         for tx in self.iter_all():
-            try:
-                last = max(last, int(tx.id[len(self.ID_PREFIX):]))
-            except ValueError:
-                continue
+            last = max(last, int(tx.id[len(self.ID_PREFIX):]))
         return f"{self.ID_PREFIX}{last + 1:0{self.ID_WIDTH}d}"
 
     def add(self, tx: Transaction) -> None:
         self.file.append_row(tx.to_dict())
 
     def add_many(self, txs: Iterable[Transaction]) -> int:
-        self.file.ensure()
         count = 0
-        with self.file.path.open("a", encoding="utf-8") as fp:
+
+        def rows() -> Iterator[dict[str, Any]]:
+            nonlocal count
+            for existing in self.iter_all():
+                yield existing.to_dict()
             for tx in txs:
-                fp.write(json.dumps(tx.to_dict(), ensure_ascii=False) + "\n")
+                yield tx.to_dict()
                 count += 1
+
+        self.file.rewrite_rows(rows())
         return count
 
     def find(self, tx_id: str) -> Transaction | None:
@@ -172,7 +184,7 @@ class CategoryStore:
         return False
 
     def load(self) -> list[str]:
-        return [str(row["name"]) for row in self.file.iter_rows()]
+        return list(self.file.iter_rows(lambda row: parse_category_name(row["name"])))
 
     def exists(self, name: str) -> bool:
         return name in self.load()
@@ -199,14 +211,15 @@ class BudgetStore:
         return self.file.ensure()
 
     def get(self, month: str) -> Budget | None:
-        for row in self.file.iter_rows():
-            if row.get("month") == month:
-                return Budget.from_dict(row)
+        for budget in self.file.iter_rows(Budget.from_dict):
+            if budget.month == month:
+                return budget
         return None
 
     def set(self, budget: Budget) -> None:
         """같은 달이 있으면 덮어쓰고, 없으면 추가한다."""
-        others = [row for row in self.file.iter_rows() if row.get("month") != budget.month]
+        others = [item.to_dict() for item in self.file.iter_rows(Budget.from_dict)
+                  if item.month != budget.month]
         others.append(budget.to_dict())
         others.sort(key=lambda r: str(r["month"]))
         self.file.rewrite_rows(others)
@@ -215,8 +228,8 @@ class BudgetStore:
 def backup_files(data_dir: Path, backup_dir: Path) -> list[Path]:
     """저장 파일 3개를 타임스탬프 폴더에 복사하고 복사된 경로를 돌려준다."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = backup_dir / stamp
-    target.mkdir(parents=True, exist_ok=True)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    target = Path(tempfile.mkdtemp(prefix=f"{stamp}-", dir=backup_dir))
     copied: list[Path] = []
     for name in (TRANSACTIONS_FILE, CATEGORIES_FILE, BUDGETS_FILE):
         src = data_dir / name

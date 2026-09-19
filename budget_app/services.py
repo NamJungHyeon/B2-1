@@ -28,14 +28,12 @@ from budget_app.storage import (
     CategoryStore,
     TransactionRepository,
     backup_files,
+    atomic_text_writer,
 )
 
+from budget_app.sorting import iter_latest, transaction_key
+
 CSV_COLUMNS: tuple[str, ...] = ("date", "type", "category", "amount", "memo", "tags")
-
-
-def _sort_key(tx: Transaction) -> tuple[str, str]:
-    """최신순 정렬 기준: 날짜, 그다음 id (id는 0으로 채워져 문자열 비교가 가능)."""
-    return (tx.date, tx.id)
 
 
 @dataclass
@@ -91,10 +89,11 @@ class BudgetService:
     # ------------------------------------------------------------ 거래 CRUD
 
     def require_category(self, name: str) -> str:
-        if not self.categories.exists(name):
+        categories = self.categories.load()
+        if name not in categories:
             raise AppError(
                 f"등록되지 않은 카테고리입니다: {name}",
-                f"category add 로 먼저 등록하세요. 현재: {', '.join(self.categories.load())}",
+                f"category add 로 먼저 등록하세요. 현재: {', '.join(categories)}",
             )
         return name
 
@@ -144,16 +143,15 @@ class BudgetService:
     @log_call
     def list_latest(self, limit: int) -> list[Transaction]:
         """스트리밍으로 읽으면서 최신 N건만 힙에 유지한다 (메모리는 N에 비례)."""
-        return heapq.nlargest(limit, self.transactions.iter_all(), key=_sort_key)
+        return heapq.nlargest(limit, self.transactions.iter_all(), key=transaction_key)
 
     def iter_search(self, flt: SearchFilter) -> Iterator[Transaction]:
-        for tx in self.transactions.iter_all():
-            if flt.matches(tx):
-                yield tx
+        matches = (tx for tx in self.transactions.iter_all() if flt.matches(tx))
+        yield from iter_latest(matches)
 
     @log_call
     def search(self, flt: SearchFilter) -> list[Transaction]:
-        return sorted(self.iter_search(flt), key=_sort_key, reverse=True)
+        return list(self.iter_search(flt))
 
     @log_call
     def summary(self, month: str, top: int) -> Summary:
@@ -218,10 +216,19 @@ class BudgetService:
     @log_call
     def export_csv(self, out: Path, flt: SearchFilter) -> int:
         count = 0
-        with out.open("w", encoding="utf-8", newline="") as fp:
+        protected = (
+            self.transactions.file.path, self.categories.file.path,
+            self.budgets.file.path, self.data_dir / "app.log",
+        )
+        for path in protected:
+            if out.resolve() == path.resolve() or (
+                out.exists() and path.exists() and out.samefile(path)
+            ):
+                raise AppError("저장 파일에는 CSV를 내보낼 수 없습니다.", "다른 출력 경로를 지정하세요.")
+        with atomic_text_writer(out) as fp:
             writer = csv.DictWriter(fp, fieldnames=CSV_COLUMNS)
             writer.writeheader()
-            for tx in self.search(flt):
+            for tx in self.iter_search(flt):
                 writer.writerow(
                     {
                         "date": tx.date,
@@ -245,7 +252,7 @@ class BudgetService:
 
         def valid_rows() -> Iterator[Transaction]:
             with src.open("r", encoding="utf-8-sig", newline="") as fp:
-                reader = csv.DictReader(fp)
+                reader = csv.DictReader(fp, strict=True)
                 missing = [c for c in CSV_COLUMNS[:4] if c not in (reader.fieldnames or [])]
                 if missing:
                     raise AppError(
