@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypeVar
 
 from budget_app import __version__
-from budget_app.decorators import handle_errors
+from budget_app.decorators import handle_errors, log_call
 from budget_app.models import (
     AppError,
     Summary,
@@ -76,14 +77,14 @@ def format_table(txs: Sequence[Transaction]) -> str:
 
 
 def format_summary(s: Summary) -> str:
-    if s.count == 0:
-        return f"{s.month}: 데이터 없음"
     lines = [
         f"[{s.month} 요약] 거래 {s.count}건",
         f"총 수입: {s.total_income:,}원",
         f"총 지출: {s.total_expense:,}원",
         f"잔액: {s.balance:,}원",
     ]
+    if s.count == 0:
+        lines.insert(1, f"{s.month}: 데이터 없음")
     if s.budget is not None:
         usage = s.budget_usage or 0.0
         lines.append(f"예산: {s.budget:,}원 (사용률 {usage:.1f}%)")
@@ -131,17 +132,22 @@ def _filter_from_args(args: argparse.Namespace) -> SearchFilter:
     )
     if getattr(args, "month", None):
         month = parse_month(args.month)
-        flt.date_from, flt.date_to = f"{month}-01", f"{month}-31"
+        last_day = calendar.monthrange(int(month[:4]), int(month[5:]))[1]
+        flt.date_from = max(flt.date_from or f"{month}-01", f"{month}-01")
+        month_end = f"{month}-{last_day:02d}"
+        flt.date_to = min(flt.date_to or month_end, month_end)
     if flt.date_from and flt.date_to and flt.date_from > flt.date_to:
         raise AppError("--from 이 --to 보다 늦습니다.", "기간을 다시 확인하세요.")
     return flt
 
 
+@log_call
 def cmd_search(args: argparse.Namespace, svc: BudgetService) -> int:
-    results = svc.search(_filter_from_args(args))
-    print(format_table(results))
-    if results:
-        print(f"({len(results)}건)")
+    count = 0
+    for tx in svc.iter_search(_filter_from_args(args)):
+        print(format_table([tx]))
+        count += 1
+    print(f"({count}건)" if count else "(거래 없음)")
     return 0
 
 
@@ -221,9 +227,9 @@ def cmd_delete(args: argparse.Namespace, svc: BudgetService) -> int:
 
 
 def cmd_export(args: argparse.Namespace, svc: BudgetService) -> int:
-    if not args.month and not (args.date_from or args.date_to):
+    if not args.month and not (args.date_from and args.date_to):
         raise AppError(
-            "export 는 --month 또는 --from/--to 중 하나 이상이 필요합니다.",
+            "export 는 --month 또는 --from과 --to가 모두 필요합니다.",
             "예: export --out out.csv --month 2024-01",
         )
     out = Path(args.out)
@@ -236,8 +242,10 @@ def cmd_import(args: argparse.Namespace, svc: BudgetService) -> int:
     result = svc.import_csv(Path(args.src))
     print(f"[완료] imported={result.imported}, skipped={result.skipped}")
     for err in result.errors:
-        print(f"  - {err}")
-    return 0
+        print(f"[오류] {err}")
+    if result.skipped:
+        print("[힌트] 표시된 행의 날짜·타입·카테고리·금액을 CSV 스키마에 맞게 수정하세요.")
+    return 1 if result.skipped else 0
 
 
 def cmd_backup(args: argparse.Namespace, svc: BudgetService) -> int:
@@ -252,8 +260,13 @@ def cmd_backup(args: argparse.Namespace, svc: BudgetService) -> int:
 # ---------------------------------------------------------------- 파서 구성
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.exit(2, f"[오류] {message}\n[힌트] {self.prog} --help로 사용법을 확인하세요.\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = ArgumentParser(
         prog="python -m budget_app",
         description="나만의 용돈 기입장 - 파일 기반 콘솔 가계부",
     )
