@@ -15,7 +15,7 @@ from budget_app.storage import JsonlFile, TransactionRepository
 
 
 def transaction_key(tx: Transaction) -> tuple[str, int]:
-    return tx.date, int(tx.id.removeprefix(TransactionRepository.ID_PREFIX))
+    return tx.date, TransactionRepository.parse_id(tx.id)
 
 
 def iter_latest(txs: Iterable[Transaction], chunk_size: int = 1000) -> Iterator[Transaction]:

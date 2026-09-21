@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from budget_app.models import AppError, parse_amount, parse_month
+from budget_app.errors import AppError
+from budget_app.validators import parse_amount, parse_month
 from budget_app.services import BudgetService, SearchFilter
 
 
@@ -83,7 +84,7 @@ class FileRegressionTest(unittest.TestCase):
         self.assertEqual(list(self.root.glob('.*.tmp')), [])
 
     def test_backups_at_same_time_are_independent(self):
-        with patch('budget_app.storage.datetime') as clock:
+        with patch('budget_app.storage.backup.datetime') as clock:
             clock.now.return_value = datetime(2024, 1, 1)
             first = self.svc.backup()
             original = first[0].read_bytes()
