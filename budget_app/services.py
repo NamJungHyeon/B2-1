@@ -1,64 +1,31 @@
 """서비스 계층. 저장소를 조합해 실제 기능(CRUD/검색/요약/입출력)을 수행한다.
 
-화면 출력은 하지 않고 값만 돌려준다. 출력은 cli.py가 담당한다.
+화면 출력은 하지 않고 값만 돌려준다. 출력은 cli 패키지가 담당한다.
 """
 
 from __future__ import annotations
 
-import csv
 import heapq
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from budget_app import csv_io
 from budget_app.decorators import log_call
-from budget_app.models import (
-    AppError,
-    Budget,
-    Summary,
-    Transaction,
-    parse_amount,
-    parse_date,
-    parse_tags,
-    parse_type,
-)
+from budget_app.errors import AppError
+from budget_app.filters import SearchFilter
+from budget_app.models import Budget, Summary, Transaction
+from budget_app.sorting import iter_latest, transaction_key
 from budget_app.storage import (
     BudgetStore,
     CategoryStore,
     TransactionRepository,
-    backup_files,
     atomic_text_writer,
+    backup_files,
 )
 
-from budget_app.sorting import iter_latest, transaction_key
-
-CSV_COLUMNS: tuple[str, ...] = ("date", "type", "category", "amount", "memo", "tags")
-
-
-@dataclass
-class SearchFilter:
-    date_from: str | None = None
-    date_to: str | None = None
-    category: str | None = None
-    type: str | None = None
-    keyword: str | None = None
-    tag: str | None = None
-
-    def matches(self, tx: Transaction) -> bool:
-        if self.date_from and tx.date < self.date_from:
-            return False
-        if self.date_to and tx.date > self.date_to:
-            return False
-        if self.category and tx.category != self.category:
-            return False
-        if self.type and tx.type != self.type:
-            return False
-        if self.keyword and self.keyword.lower() not in tx.memo.lower():
-            return False
-        if self.tag and self.tag not in tx.tags:
-            return False
-        return True
+__all__ = ["BudgetService", "ImportResult", "SearchFilter"]
 
 
 @dataclass
@@ -78,12 +45,9 @@ class BudgetService:
     def initialize(self) -> list[str]:
         """저장 파일이 없으면 만든다. 새로 만든 파일 이름 목록을 돌려준다."""
         created: list[str] = []
-        if self.transactions.ensure():
-            created.append(self.transactions.file.path.name)
-        if self.categories.ensure():
-            created.append(self.categories.file.path.name)
-        if self.budgets.ensure():
-            created.append(self.budgets.file.path.name)
+        for store in (self.transactions, self.categories, self.budgets):
+            if store.ensure():
+                created.append(store.file.path.name)
         return created
 
     # ------------------------------------------------------------ 거래 CRUD
@@ -213,72 +177,45 @@ class BudgetService:
 
     # ------------------------------------------------------------ import / export
 
+    def _protected_paths(self) -> tuple[Path, ...]:
+        return (
+            self.transactions.file.path,
+            self.categories.file.path,
+            self.budgets.file.path,
+            self.data_dir / "app.log",
+        )
+
     @log_call
     def export_csv(self, out: Path, flt: SearchFilter) -> int:
-        count = 0
-        protected = (
-            self.transactions.file.path, self.categories.file.path,
-            self.budgets.file.path, self.data_dir / "app.log",
-        )
-        for path in protected:
+        for path in self._protected_paths():
             if out.resolve() == path.resolve() or (
                 out.exists() and path.exists() and out.samefile(path)
             ):
                 raise AppError("저장 파일에는 CSV를 내보낼 수 없습니다.", "다른 출력 경로를 지정하세요.")
+        count = 0
         with atomic_text_writer(out) as fp:
-            writer = csv.DictWriter(fp, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
+            writer = csv_io.open_csv_writer(fp)
             for tx in self.iter_search(flt):
-                writer.writerow(
-                    {
-                        "date": tx.date,
-                        "type": tx.type,
-                        "category": tx.category,
-                        "amount": tx.amount,
-                        "memo": tx.memo,
-                        "tags": ",".join(tx.tags),
-                    }
-                )
+                writer.writerow(csv_io.transaction_to_row(tx))
                 count += 1
         return count
 
     @log_call
     def import_csv(self, src: Path) -> ImportResult:
         """CSV를 한 줄씩 읽어 검증하고, 유효한 것만 일괄 저장한다. 잘못된 줄은 건너뛴다."""
-        if not src.exists():
-            raise AppError(f"파일을 찾을 수 없습니다: {src}", "경로를 확인하세요.")
         known = set(self.categories.load())
         errors: list[str] = []
 
         def valid_rows() -> Iterator[Transaction]:
-            with src.open("r", encoding="utf-8-sig", newline="") as fp:
-                reader = csv.DictReader(fp, strict=True)
-                missing = [c for c in CSV_COLUMNS[:4] if c not in (reader.fieldnames or [])]
-                if missing:
-                    raise AppError(
-                        f"CSV 헤더에 필수 컬럼이 없습니다: {', '.join(missing)}",
-                        f"필수 컬럼: {', '.join(CSV_COLUMNS[:4])}",
-                    )
-                next_no = int(self.transactions.next_id()[len(TransactionRepository.ID_PREFIX):])
-                for line_no, row in enumerate(reader, start=2):
-                    try:
-                        category = (row.get("category") or "").strip()
-                        if category not in known:
-                            raise AppError(f"등록되지 않은 카테고리: {category}")
-                        tx = Transaction(
-                            id=f"{TransactionRepository.ID_PREFIX}{next_no:0{TransactionRepository.ID_WIDTH}d}",
-                            type=parse_type(row.get("type") or ""),
-                            date=parse_date(row.get("date") or ""),
-                            amount=parse_amount(row.get("amount") or ""),
-                            category=category,
-                            memo=(row.get("memo") or "").strip(),
-                            tags=parse_tags(row.get("tags")),
-                        )
-                    except AppError as exc:
-                        errors.append(f"{line_no}행: {exc.message}")
-                        continue
-                    next_no += 1
-                    yield tx
+            next_no = self.transactions.next_number()
+            for line_no, row in csv_io.iter_csv_rows(src):
+                try:
+                    tx = csv_io.row_to_transaction(row, self.transactions.format_id(next_no), known)
+                except AppError as exc:
+                    errors.append(f"{line_no}행: {exc.message}")
+                    continue
+                next_no += 1
+                yield tx
 
         imported = self.transactions.add_many(valid_rows())
         return ImportResult(imported=imported, skipped=len(errors), errors=errors)
