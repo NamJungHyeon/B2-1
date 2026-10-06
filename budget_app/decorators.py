@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
-from budget_app.models import AppError
+from budget_app.errors import AppError
 
 P = ParamSpec("P")
 R = TypeVar("R")

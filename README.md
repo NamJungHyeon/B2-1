@@ -179,13 +179,27 @@ python3 -m budget_app backup
 
 ```
 budget_app/
-├── __main__.py    # python -m budget_app 진입점
-├── cli.py         # argparse, 대화형 입력, 화면 출력
-├── services.py    # BudgetService: CRUD/검색/요약/import·export (출력 없음)
-├── storage.py     # JsonlFile, TransactionRepository, CategoryStore, BudgetStore (파일 I/O, 원자적 교체)
-├── models.py      # Transaction/Budget/Summary dataclass, 입력 검증, AppError
-├── sorting.py     # 임시 JSONL 파일을 이용한 스트리밍 외부 병합 정렬
-└── decorators.py  # handle_errors(예외 → 메시지+종료코드), log_call(실행 로그·시간 측정)
+├── __main__.py        # python -m budget_app 진입점
+├── errors.py          # AppError (원인 + 힌트)
+├── validators.py      # parse_date/month/type/amount/tags/category_name — 입력 검증
+├── models.py          # Transaction / Budget / Summary dataclass
+├── decorators.py      # handle_errors(예외 → 메시지+종료코드), log_call(실행 로그·시간 측정)
+├── filters.py         # SearchFilter — 검색 조건
+├── sorting.py         # 임시 JSONL 파일을 이용한 스트리밍 외부 병합 정렬
+├── csv_io.py          # import/export CSV 스키마와 행 ↔ Transaction 변환
+├── services.py        # BudgetService: CRUD/검색/요약/import·export (출력 없음)
+├── storage/           # 파일 I/O 계층
+│   ├── jsonl.py       #   JsonlFile, atomic_text_writer (스트리밍 읽기, 원자적 교체)
+│   ├── transactions.py#   TransactionRepository
+│   ├── categories.py  #   CategoryStore, 기본 카테고리
+│   ├── budgets.py     #   BudgetStore
+│   └── backup.py      #   backup_files
+└── cli/               # 콘솔 계층
+    ├── main.py        #   진입점, 로깅 설정
+    ├── parser.py      #   argparse 서브커맨드 정의
+    ├── commands.py    #   cmd_* 핸들러 (args, svc) → exit code
+    ├── prompts.py     #   대화형 입력 (재입력 루프)
+    └── formatting.py  #   표/요약 출력 포맷
 tests/
 ├── test_budget_app.py
 ├── test_regressions.py
@@ -193,11 +207,13 @@ tests/
 └── test_sorting.py
 ```
 
-- **모델**: 값의 형태와 검증 규칙만 안다. 파일도 화면도 모른다.
-- **저장소**: 파일 하나씩 책임진다. 읽기는 `yield`로 스트리밍, 재작성은 임시 파일 + `os.replace`.
-- **서비스**: 저장소를 조합해 기능을 만든다. 결과를 값으로 돌려주고 출력하지 않는다.
-- **CLI**: 인자를 파싱해 서비스를 호출하고 결과를 포맷해 출력한다.
-- **데코레이터**: `handle_errors`는 CLI 진입점에, `log_call`은 서비스 메서드에 붙어 공통 관심사를 분리한다.
+의존 방향은 아래에서 위로만 흐른다 (cli → services → storage → models → validators → errors).
+
+- **errors / validators / models**: 값의 형태와 검증 규칙만 안다. 파일도 화면도 모른다.
+- **storage**: 파일 하나씩 책임진다. 읽기는 `yield`로 스트리밍, 재작성은 임시 파일 + `os.replace`.
+- **services**: 저장소를 조합해 기능을 만든다. 결과를 값으로 돌려주고 출력하지 않는다.
+- **cli**: 인자를 파싱해 서비스를 호출하고 결과를 포맷해 출력한다.
+- **decorators**: `handle_errors`는 CLI 진입점에, `log_call`은 서비스 메서드에 붙어 공통 관심사를 분리한다.
 
 ## 과제 요구사항 검증
 

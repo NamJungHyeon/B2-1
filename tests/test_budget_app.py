@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from budget_app.models import AppError, parse_amount, parse_date, parse_tags, parse_type
+from budget_app.errors import AppError
+from budget_app.validators import parse_amount, parse_date, parse_tags, parse_type
 from budget_app.services import BudgetService, SearchFilter
 
 
